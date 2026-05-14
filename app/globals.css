@@ -1,26 +1,35 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --paper:       #FFF8EC;
+  --ink:         #1F1B2E;
+  --mute:        #6B6478;
+  --line:        rgba(31,27,46,.10);
+  --yellow:      #FFD56B;
+  --green:       #8FD86A;
+  --pink:        #FF8FA3;
+  --blue:        #6FB1FF;
+  --yellow-soft: #FFE08A;
+  --green-soft:  #B6E89A;
+  --pink-soft:   #FFB1BE;
+  --blue-soft:   #A4CBFF;
+
+  /* font families exposed as variables */
+  --ff-bricolage: var(--font-bricolage), system-ui, sans-serif;
+  --ff-schibsted:  var(--font-schibsted), system-ui, sans-serif;
+  --ff-caveat:    var(--font-caveat), cursive;
+  --ff-jetbrains: var(--font-jetbrains), monospace;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+* { box-sizing: border-box; margin: 0; padding: 0; }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
+html, body { height: 100%; }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--ff-schibsted);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
+
+::selection { background: var(--yellow); color: var(--ink); }
