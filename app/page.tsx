@@ -243,6 +243,14 @@ function CreatePanel({
   const [localName,  setLocalName]  = useState(initialName);
   const [localAnon,  setLocalAnon]  = useState(false);
   const [code]                      = useState(() => generateRoomCode());
+  const [copied,     setCopied]     = useState(false);
+
+  const copyCode = () => {
+    navigator.clipboard.writeText(code).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
 
   const canSubmit = (localAnon || localName.trim()) && !submitting;
 
@@ -324,9 +332,20 @@ function CreatePanel({
           </div>
         </div>
         <div style={{ flex: 1 }} />
-        <div style={{ fontFamily: FF.caveat, fontSize: 15, opacity: 0.75, maxWidth: 130, textAlign: 'right', lineHeight: 1.2 }}>
-          share this with your team
-        </div>
+        <button onClick={copyCode} style={{
+          border: 'none', borderRadius: 8, cursor: 'pointer',
+          background: copied ? 'rgba(31,27,46,.15)' : 'rgba(31,27,46,.10)',
+          color: C.ink, padding: '7px 12px',
+          fontSize: 12, fontWeight: 700, fontFamily: FF.schibsted,
+          display: 'flex', alignItems: 'center', gap: 6,
+          transition: 'background .15s',
+        }}>
+          {copied ? (
+            <><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M2 6l3 3 5-5"/></svg> Copied!</>
+          ) : (
+            <><svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="4" y="4" width="7" height="7" rx="1.5"/><path d="M8 4V2.5A1.5 1.5 0 0 0 6.5 1h-4A1.5 1.5 0 0 0 1 2.5v4A1.5 1.5 0 0 0 2.5 8H4"/></svg> Copy code</>
+          )}
+        </button>
       </div>
       <button
         style={{
@@ -362,6 +381,15 @@ export default function LandingPage() {
   const [submitting, setSubmitting] = useState(false);
   const [hint, setHint]         = useState<{ kind: 'err'; text: string } | null>(null);
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const preCode = params.get('code');
+    if (preCode) {
+      setCode(preCode.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, CODE_LEN));
+      setTab('join');
+    }
+  }, []);
+
   const submit = useCallback(async () => {
     if (code.length !== CODE_LEN) {
       setErrorKey(Date.now());
@@ -373,7 +401,7 @@ export default function LandingPage() {
       return;
     }
     setSubmitting(true);
-    const { data, error } = await supabase.from('retro_rooms').select('code').eq('code', code).maybeSingle();
+    const { data, error } = await supabase.from('retro_rooms').select('code, sprint_name, team').eq('code', code).maybeSingle();
     // Only block when DB is reachable but room genuinely doesn't exist
     if (!error && data === null) {
       setSubmitting(false);
@@ -381,10 +409,13 @@ export default function LandingPage() {
       setHint({ kind: 'err', text: "Room not found. Check the code and try again." });
       return;
     }
+    const sprintParam = (data as { sprint_name?: string } | null)?.sprint_name || `Retro · ${code}`;
+    const teamParam   = (data as { team?: string } | null)?.team || '';
     router.push(
       '/board?code=' + encodeURIComponent(code) +
       '&name=' + encodeURIComponent(anon ? 'Anon' : name.trim()) +
-      '&sprint=' + encodeURIComponent(`Retro · ${code}`) +
+      '&sprint=' + encodeURIComponent(sprintParam) +
+      '&team=' + encodeURIComponent(teamParam) +
       (anon ? '&anon=1' : ''),
     );
   }, [code, name, anon, router]);
@@ -392,13 +423,14 @@ export default function LandingPage() {
   const submitCreate = useCallback(async (payload: { code: string; name: string; sprint: string; team: string }) => {
     setSubmitting(true);
     try {
-      await supabase.from('retro_rooms').insert({ code: payload.code, creator: payload.name });
+      await supabase.from('retro_rooms').insert({ code: payload.code, creator: payload.name, sprint_name: payload.sprint, team: payload.team });
     } catch { /* table may not exist yet — navigate anyway */ }
     try { localStorage.setItem('retro-creator-' + payload.code, '1'); } catch { /* ignore */ }
     router.push(
       '/board?code=' + encodeURIComponent(payload.code) +
       '&name=' + encodeURIComponent(payload.name) +
-      '&sprint=' + encodeURIComponent(payload.sprint + ' · Retrospective') +
+      '&sprint=' + encodeURIComponent(payload.sprint) +
+      '&team=' + encodeURIComponent(payload.team) +
       (payload.name === 'Anon' ? '&anon=1' : ''),
     );
   }, [router]);

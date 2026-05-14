@@ -73,6 +73,8 @@ Open the **SQL Editor** in your Supabase dashboard and run this once:
 create table if not exists retro_rooms (
   code        text primary key,
   creator     text not null,
+  sprint_name text,
+  team        text,
   created_at  timestamptz not null default now()
 );
 
@@ -92,6 +94,27 @@ create table if not exists retro_cards (
 );
 
 create index if not exists retro_cards_room_idx on retro_cards (room_code);
+
+-- Comments
+create table if not exists retro_comments (
+  id         text primary key,
+  card_id    text not null,
+  room_code  text not null,
+  author     text not null,
+  text       text not null,
+  created_at bigint not null
+);
+create index if not exists retro_comments_card_idx on retro_comments (card_id);
+alter table retro_comments enable row level security;
+create policy "open" on retro_comments for all using (true) with check (true);
+
+-- Spotlight (facilitator discussion focus)
+create table if not exists retro_spotlight (
+  room_code text primary key,
+  card_id   text
+);
+alter table retro_spotlight enable row level security;
+create policy "open" on retro_spotlight for all using (true) with check (true);
 
 -- Participants
 create table if not exists retro_participants (
@@ -113,6 +136,8 @@ create policy "open" on retro_participants for all using (true) with check (true
 -- Enable realtime
 alter publication supabase_realtime add table retro_cards;
 alter publication supabase_realtime add table retro_participants;
+alter publication supabase_realtime add table retro_comments;
+alter publication supabase_realtime add table retro_spotlight;
 ```
 
 ### 3. Set environment variables

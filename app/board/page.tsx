@@ -32,7 +32,7 @@ const PHASES: { id: PhaseId; title: string; prompt: string }[] = [
 
 const PHASE_IDX = Object.fromEntries(PHASES.map((p, i) => [p.id, i])) as Record<PhaseId, number>;
 
-const CARD_SHAPE = { radius: 8, tiltMax: 0, shadow: '0 1px 3px rgba(0,0,0,.07), 0 1px 2px rgba(0,0,0,.04)' };
+const CARD_SHAPE = { radius: 10, tiltMax: 0, shadow: '0 2px 6px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.05)' };
 
 const PLACEHOLDERS: Record<PhaseId, [string, string]> = {
   wentWell: ['Add a win…',           'A small thing that made you smile?'],
@@ -68,6 +68,14 @@ interface DragState {
   x: number; y: number; ox: number; oy: number; rot: number;
 }
 
+interface RetroComment {
+  id: string;
+  cardId: string;
+  author: string;
+  text: string;
+  createdAt: number;
+}
+
 interface ConfettiBurst { id: number; x: number; y: number; }
 interface TimerState { running: boolean; secs: number; set: number; }
 
@@ -82,6 +90,10 @@ interface RetroCtxValue {
   confetti: ConfettiBurst[];
   userName: string;
   isCreator: boolean;
+  spotlightId: string | null;
+  setSpotlight: (id: string | null) => Promise<void>;
+  comments: RetroComment[];
+  addComment: (cardId: string, text: string) => void;
   addCard: (phase: PhaseId, text: string, opts?: { derivedFrom?: string; author?: string }) => void;
   editCard: (id: string, patch: Partial<RetroCard>) => void;
   deleteCard: (id: string) => void;
@@ -101,6 +113,16 @@ function mulberry32(seed: number) {
     r = Math.imul(r ^ (r >>> 15), r | 1);
     r ^= r + Math.imul(r ^ (r >>> 7), r | 61);
     return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function dbToComment(row: Record<string, unknown>): RetroComment {
+  return {
+    id:        row.id as string,
+    cardId:    row.card_id as string,
+    author:    row.author as string,
+    text:      row.text as string,
+    createdAt: row.created_at as number,
   };
 }
 
@@ -139,6 +161,9 @@ function RetroProvider({ userName, roomCode, children }: { userName: string; roo
     setIsCreator(localStorage.getItem('retro-creator-' + roomCode) === '1');
   }, [roomCode]);
 
+  const [spotlightId,  setSpotlightId]  = useState<string | null>(null);
+  const [comments,     setComments]     = useState<RetroComment[]>([]);
+
   const [cards,        setCards]        = useState<RetroCard[]>([]);
   const [participants, setParticipants] = useState<string[]>([]);
   const [composerFor,  setComposerFor]  = useState<PhaseId | null>(null);
@@ -162,13 +187,17 @@ function RetroProvider({ userName, roomCode, children }: { userName: string; roo
     let cancelled = false;
 
     const fetchAll = async () => {
-      const [{ data: cardRows }, { data: partRows }] = await Promise.all([
+      const [{ data: cardRows }, { data: partRows }, { data: spotRow }, { data: commentRows }] = await Promise.all([
         supabase.from('retro_cards').select('*').eq('room_code', roomCode).order('created_at'),
         supabase.from('retro_participants').select('name').eq('room_code', roomCode),
+        supabase.from('retro_spotlight').select('card_id').eq('room_code', roomCode).maybeSingle(),
+        supabase.from('retro_comments').select('*').eq('room_code', roomCode).order('created_at'),
       ]);
       if (cancelled) return;
       const voted = getVoted();
       if (cardRows) setCards(cardRows.map((r) => dbToCard(r, voted)));
+      if (spotRow) setSpotlightId((spotRow as { card_id: string | null }).card_id);
+      if (commentRows) setComments(commentRows.map(dbToComment));
 
       // Register this user as a participant (upsert is safe if already present)
       await supabase.from('retro_participants').upsert({ room_code: roomCode, name: userName }, { onConflict: 'room_code,name' });
@@ -188,6 +217,10 @@ function RetroProvider({ userName, roomCode, children }: { userName: string; roo
       const { data } = await supabase.from('retro_participants').select('name').eq('room_code', roomCode);
       if (data && !cancelled) setParticipants(data.map((p: { name: string }) => p.name));
     };
+    const refetchComments = async () => {
+      const { data } = await supabase.from('retro_comments').select('*').eq('room_code', roomCode).order('created_at');
+      if (data && !cancelled) setComments(data.map(dbToComment));
+    };
 
     const cardsSub = supabase
       .channel(`cards-${roomCode}`)
@@ -199,10 +232,26 @@ function RetroProvider({ userName, roomCode, children }: { userName: string; roo
       .on('postgres_changes', { event: '*', schema: 'public', table: 'retro_participants', filter: `room_code=eq.${roomCode}` }, refetchParts)
       .subscribe();
 
+    const spotlightSub = supabase
+      .channel(`db-spotlight-${roomCode}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'retro_spotlight', filter: `room_code=eq.${roomCode}` }, (payload) => {
+        if (cancelled) return;
+        const next = payload.eventType === 'DELETE' ? null : (payload.new as { card_id: string | null }).card_id ?? null;
+        setSpotlightId(next);
+      })
+      .subscribe();
+
+    const commentsSub = supabase
+      .channel(`comments-${roomCode}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'retro_comments', filter: `room_code=eq.${roomCode}` }, refetchComments)
+      .subscribe();
+
     return () => {
       cancelled = true;
       cardsSub.unsubscribe();
       partsSub.unsubscribe();
+      spotlightSub.unsubscribe();
+      commentsSub.unsubscribe();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomCode, userName]);
@@ -267,11 +316,26 @@ function RetroProvider({ userName, roomCode, children }: { userName: string; roo
     }
   }, [cards, roomCode, userName, fireConfetti]);
 
+  const setSpotlight = useCallback(async (cardId: string | null) => {
+    setSpotlightId(cardId);
+    await supabase.from('retro_spotlight').upsert({ room_code: roomCode, card_id: cardId });
+  }, [roomCode]);
+
+  const addComment = useCallback(async (cardId: string, text: string) => {
+    if (!text.trim()) return;
+    await supabase.from('retro_comments').insert({
+      id: uid(), card_id: cardId, room_code: roomCode,
+      author: userName || 'You', text: text.trim(), created_at: Date.now(),
+    });
+  }, [roomCode, userName]);
+
   return (
     <RetroCtx.Provider value={{
       cards, participants, composerFor, setComposerFor, revealed, setRevealed,
       activePhase, setActivePhase, timer, setTimer, drag, setDrag,
-      confetti, userName, isCreator, addCard, editCard, deleteCard, toggleVote, movePhase, convertToAction,
+      confetti, userName, isCreator, spotlightId, setSpotlight,
+      comments, addComment,
+      addCard, editCard, deleteCard, toggleVote, movePhase, convertToAction,
     }}>
       {children}
     </RetroCtx.Provider>
@@ -529,10 +593,12 @@ function CardView({ card, onConvert }: {
 }) {
   const r  = useRetro();
   const pc = PALETTE.phases[card.phase];
-  const [editing,  setEditing]  = useState(false);
-  const [draft,    setDraft]    = useState(card.text);
-  const [menu,     setMenu]     = useState(false);
-  const [voteAnim, setVoteAnim] = useState(false);
+  const [editing,      setEditing]      = useState(false);
+  const [draft,        setDraft]        = useState(card.text);
+  const [menu,         setMenu]         = useState(false);
+  const [voteAnim,     setVoteAnim]     = useState(false);
+  const [showComments, setShowComments] = useState(false);
+  const commentCount = r.comments.filter((c) => c.cardId === card.id).length;
 
   const cardRef   = useRef<HTMLDivElement>(null);
   const footerRef = useRef<HTMLDivElement>(null);
@@ -580,7 +646,8 @@ function CardView({ card, onConvert }: {
     window.addEventListener('pointerup', up);
   };
 
-  const isDragging = r.drag?.id === card.id;
+  const isDragging  = r.drag?.id === card.id;
+  const isSpotlit   = r.spotlightId === card.id;
 
   const onVote = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -590,20 +657,39 @@ function CardView({ card, onConvert }: {
   };
 
   return (
-    <div ref={cardRef} onPointerDown={onPointerDown} style={{
-      position: 'relative', background: pc.sticky, color: pc.ink,
-      borderRadius: CARD_SHAPE.radius,
-      padding: '13px 13px 11px 14px',
-      boxShadow: isDragging ? '0 20px 48px rgba(0,0,0,.16)' : CARD_SHAPE.shadow,
-      transform: isDragging ? 'scale(1.03)' : 'none',
-      transition: isDragging ? 'none' : 'box-shadow .15s, transform .15s',
-      cursor: isDragging ? 'grabbing' : 'grab',
-      opacity: isDragging ? 0.25 : 1,
-      fontSize: 14, lineHeight: 1.5, fontFamily: FF.schibsted, fontWeight: 500,
-      userSelect: editing ? 'text' : 'none',
-      width: '100%', boxSizing: 'border-box',
-      zIndex: menu ? 20 : 'auto',
-    }}>
+    <div ref={cardRef} onPointerDown={onPointerDown}
+      className={`retro-card${isSpotlit ? ' spotlight-card' : ''}`}
+      style={{
+        position: 'relative', background: pc.sticky, color: pc.ink,
+        borderRadius: CARD_SHAPE.radius,
+        padding: '16px 16px 14px 16px',
+        boxShadow: isDragging
+          ? '0 20px 48px rgba(0,0,0,.16)'
+          : isSpotlit
+          ? `0 0 0 3px ${pc.hero}, 0 12px 32px rgba(0,0,0,.18)`
+          : CARD_SHAPE.shadow,
+        transform: isDragging ? 'scale(1.03)' : 'none',
+        transition: isDragging ? 'none' : 'box-shadow .2s, transform .15s',
+        cursor: isDragging ? 'grabbing' : 'grab',
+        opacity: isDragging ? 0.25 : 1,
+        fontSize: 15, lineHeight: 1.5, fontFamily: FF.schibsted, fontWeight: 500,
+        userSelect: editing ? 'text' : 'none',
+        width: '100%', boxSizing: 'border-box',
+        zIndex: menu ? 20 : isSpotlit ? 10 : 'auto',
+      }}>
+      {/* Spotlight badge */}
+      {isSpotlit && (
+        <div data-no-drag style={{
+          display: 'inline-flex', alignItems: 'center', gap: 5, marginBottom: 8,
+          padding: '2px 8px 2px 6px', borderRadius: 99,
+          background: pc.hero, color: pc.ink,
+          fontSize: 10, fontWeight: 700, letterSpacing: '.07em', textTransform: 'uppercase',
+        }}>
+          <span className="spotlight-dot" style={{ width: 6, height: 6, borderRadius: 99, background: pc.ink, display: 'block' }} />
+          Discussing
+        </div>
+      )}
+
       {/* "from improve" badge */}
       {card.derivedFrom && (
         <div data-no-drag style={{
@@ -664,6 +750,20 @@ function CardView({ card, onConvert }: {
         <Avatar name={card.author} size={18} />
         <span style={{ fontFamily: FF.schibsted, fontSize: 11, color: pc.ink, opacity: .65, flex: 1 }}>{card.author}</span>
 
+        {/* Comments toggle */}
+        <button data-no-drag onClick={() => setShowComments((v) => !v)} style={{
+          display: 'flex', alignItems: 'center', gap: 3, border: 'none',
+          background: showComments ? 'rgba(0,0,0,.12)' : 'transparent',
+          padding: '3px 6px', borderRadius: 6, cursor: 'pointer',
+          color: pc.ink, opacity: commentCount > 0 ? 1 : 0.45,
+          fontSize: 11, fontWeight: 700, transition: 'background .12s',
+        }}>
+          <svg width="11" height="11" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 8a2 2 0 0 1-2 2H4l-2 2V4a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v4Z"/>
+          </svg>
+          {commentCount > 0 && <span>{commentCount}</span>}
+        </button>
+
         {/* Vote */}
         <button data-no-drag onClick={onVote} style={{
           display: 'flex', alignItems: 'center', gap: 4, border: 'none',
@@ -700,6 +800,9 @@ function CardView({ card, onConvert }: {
           fontFamily: FF.schibsted, fontSize: 13, color: PALETTE.ink,
         }}>
           <MenuBtn onClick={() => { setMenu(false); setEditing(true); }}>Edit</MenuBtn>
+          <MenuBtn onClick={() => { setMenu(false); r.setSpotlight(isSpotlit ? null : card.id); }}>
+            {isSpotlit ? '✕  Remove spotlight' : '◎  Spotlight this card'}
+          </MenuBtn>
           {card.phase === 'improve' && (
             <MenuBtn onClick={() => { setMenu(false); onConvert?.(card.id, footerRef as React.RefObject<HTMLElement | null>); }}>
               Convert → action item
@@ -723,6 +826,72 @@ function CardView({ card, onConvert }: {
           <MenuBtn danger onClick={() => { setMenu(false); r.deleteCard(card.id); }}>Delete</MenuBtn>
         </div>
       )}
+
+      {showComments && <CommentThread cardId={card.id} pc={pc} />}
+    </div>
+  );
+}
+
+// ── Comment thread ────────────────────────────────────────────────────────────
+function CommentThread({ cardId, pc }: { cardId: string; pc: typeof PALETTE.phases[PhaseId] }) {
+  const r = useRetro();
+  const cardComments = r.comments.filter((c) => c.cardId === cardId);
+  const [draft, setDraft] = useState('');
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [cardComments.length]);
+
+  const submit = () => {
+    if (!draft.trim()) return;
+    r.addComment(cardId, draft.trim());
+    setDraft('');
+  };
+
+  return (
+    <div data-no-drag style={{ marginTop: 10, borderTop: `1px solid rgba(0,0,0,.09)`, paddingTop: 8 }}>
+      {cardComments.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 8, maxHeight: 160, overflowY: 'auto' }}>
+          {cardComments.map((c) => (
+            <div key={c.id} style={{ display: 'flex', gap: 6, alignItems: 'flex-start' }}>
+              <Avatar name={c.author} size={16} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ fontWeight: 700, fontSize: 10, color: pc.ink, fontFamily: FF.schibsted }}>{c.author} </span>
+                <span style={{ fontSize: 12, color: pc.ink, fontFamily: FF.schibsted, wordBreak: 'break-word' }}>{c.text}</span>
+              </div>
+            </div>
+          ))}
+          <div ref={bottomRef} />
+        </div>
+      )}
+      <div style={{ display: 'flex', gap: 5 }}>
+        <input
+          data-no-drag
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } }}
+          placeholder="Reply…"
+          style={{
+            flex: 1, border: '1.5px solid rgba(0,0,0,.12)', borderRadius: 6,
+            background: 'rgba(255,255,255,.55)', color: pc.ink,
+            fontFamily: FF.schibsted, fontSize: 12, padding: '5px 8px',
+            outline: 'none',
+          }}
+        />
+        <button
+          data-no-drag
+          onClick={submit}
+          disabled={!draft.trim()}
+          style={{
+            border: 'none', borderRadius: 6, padding: '5px 10px',
+            background: draft.trim() ? pc.hero : 'rgba(0,0,0,.07)',
+            color: draft.trim() ? pc.ink : 'rgba(0,0,0,.3)',
+            fontSize: 11, fontWeight: 700, fontFamily: FF.schibsted, cursor: draft.trim() ? 'pointer' : 'default',
+            transition: 'background .12s',
+          }}
+        >Post</button>
+      </div>
     </div>
   );
 }
@@ -753,10 +922,8 @@ function RetroColumn({ phaseId }: { phaseId: PhaseId }) {
   return (
     <div data-retro-column={phaseId} style={{
       display: 'flex', flexDirection: 'column', minHeight: 0,
-      background: over ? pc.soft : '#fff',
+      background: over ? pc.soft : 'transparent',
       borderRadius: 10,
-      borderTop: `3px solid ${pc.hero}`,
-      boxShadow: '0 1px 4px rgba(0,0,0,.06)',
       padding: '14px 14px 16px',
       transition: 'background .15s',
       height: '100%', boxSizing: 'border-box',
@@ -764,23 +931,24 @@ function RetroColumn({ phaseId }: { phaseId: PhaseId }) {
       outlineOffset: 2,
     }}>
       {/* Column header */}
-      <div ref={headerRef} style={{ flexShrink: 0, marginBottom: 12 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+      <div ref={headerRef} style={{ flexShrink: 0, marginBottom: 10 }}>
+        {/* Title row */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 5 }}>
           <span style={{
-            fontFamily: FF.schibsted, fontWeight: 700, fontSize: 12,
-            letterSpacing: '.07em', textTransform: 'uppercase', color: PALETTE.mute, flex: 1,
+            fontFamily: FF.bricolage, fontWeight: 800, fontSize: 22,
+            letterSpacing: '-0.02em', color: PALETTE.ink, flex: 1, lineHeight: 1.1,
           }}>{meta.title}</span>
           <span style={{
-            fontFamily: FF.jetbrains, fontSize: 10, fontWeight: 700,
+            fontFamily: FF.jetbrains, fontSize: 11, fontWeight: 700,
             color: cards.length > 0 ? pc.ink : PALETTE.mute,
             background: cards.length > 0 ? pc.soft : 'rgba(0,0,0,.06)',
-            padding: '1px 7px', borderRadius: 99, fontVariantNumeric: 'tabular-nums',
-          }}>{cards.length}</span>
+            padding: '2px 8px', borderRadius: 99, fontVariantNumeric: 'tabular-nums',
+          }}>{String(cards.length).padStart(2, '0')}</span>
           <button
             onClick={() => r.setComposerFor(isComposing ? null : phaseId)}
             style={{
               border: 'none', background: isComposing ? PALETTE.ink : pc.hero, color: isComposing ? '#fff' : pc.ink,
-              width: 24, height: 24, borderRadius: 6, cursor: 'pointer',
+              width: 26, height: 26, borderRadius: '50%', cursor: 'pointer',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
               transition: 'background .12s', flexShrink: 0,
             }}
@@ -791,19 +959,21 @@ function RetroColumn({ phaseId }: { phaseId: PhaseId }) {
             </svg>
           </button>
         </div>
-        <p style={{ margin: 0, fontFamily: FF.schibsted, fontSize: 12, color: PALETTE.mute, lineHeight: 1.4 }}>
+        {/* Straight underline */}
+        <div style={{ height: 3, borderRadius: 99, background: pc.hero, marginBottom: 8 }} />
+        {/* Description */}
+        <p style={{ margin: 0, fontFamily: FF.schibsted, fontSize: 12, color: PALETTE.mute, lineHeight: 1.4, fontStyle: 'italic' }}>
           {meta.prompt}
         </p>
-        <div style={{ height: 1, background: 'rgba(0,0,0,.06)', marginTop: 12 }} />
       </div>
 
       {/* Composer */}
-      {isComposing && <div style={{ marginBottom: 8 }}><CardComposer phaseId={phaseId} onClose={() => r.setComposerFor(null)} /></div>}
+      {isComposing && <div style={{ marginBottom: 8, marginTop: 8 }}><CardComposer phaseId={phaseId} onClose={() => r.setComposerFor(null)} /></div>}
 
       {/* Card list */}
       <div style={{
         display: 'flex', flexDirection: 'column', gap: 8,
-        overflowY: 'auto', minHeight: 40, flex: '1 1 auto',
+        overflowY: 'auto', minHeight: 40, flex: '1 1 auto', marginTop: 8,
       }}>
         {cards.length === 0 && !isComposing && (
           <EmptyPlaceholder phaseId={phaseId} onClick={() => r.setComposerFor(phaseId)} />
@@ -904,12 +1074,19 @@ function TimerPill() {
 }
 
 // ── Header ────────────────────────────────────────────────────────────────────
-function RetroHeader({ sprintName, code }: { sprintName: string; code: string }) {
+function RetroHeader({ sprintName, team, code }: { sprintName: string; team: string; code: string }) {
   const r = useRetro();
+  const [linkCopied, setLinkCopied] = useState(false);
+  const copyLink = () => {
+    navigator.clipboard.writeText(window.location.origin + '/?code=' + code).then(() => {
+      setLinkCopied(true);
+      setTimeout(() => setLinkCopied(false), 2000);
+    });
+  };
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 18, padding: '12px 24px',
-      background: '#fff', borderBottom: `1px solid rgba(0,0,0,.07)`, flexShrink: 0,
+      background: PALETTE.paper, borderBottom: `1px solid rgba(0,0,0,.07)`, flexShrink: 0,
     }}>
       {/* Brand + sprint */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -938,9 +1115,22 @@ function RetroHeader({ sprintName, code }: { sprintName: string; code: string })
             </Link>
           </div>
           <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 4, fontSize: 11, color: PALETTE.mute, fontFamily: FF.jetbrains }}>
+            {team && <><span style={{ fontWeight: 600, color: PALETTE.ink }}>{team}</span><span style={{ width: 3, height: 3, borderRadius: 3, background: 'currentColor', opacity: .5 }} /></>}
             <span>code · <b style={{ color: PALETTE.ink }}>{code}</b></span>
-            <span style={{ width: 3, height: 3, borderRadius: 3, background: 'currentColor', opacity: .5 }} />
-            <span>share to invite teammates</span>
+            <button onClick={copyLink} style={{
+              border: 'none', background: linkCopied ? PALETTE.phases.continue.soft : 'rgba(31,27,46,.06)',
+              color: linkCopied ? PALETTE.phases.continue.ink : PALETTE.mute,
+              padding: '2px 7px', borderRadius: 5, cursor: 'pointer',
+              fontSize: 10, fontWeight: 700, fontFamily: FF.schibsted,
+              display: 'inline-flex', alignItems: 'center', gap: 4,
+              transition: 'background .15s, color .15s',
+            }}>
+              {linkCopied ? (
+                <><svg width="9" height="9" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M2 6l3 3 5-5"/></svg> Copied!</>
+              ) : (
+                <><svg width="9" height="9" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M8 5H5a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h3a2 2 0 0 0 2-2V7"/><path d="M7 1h4v4"/><path d="M12 1L7 6"/></svg> Copy link</>
+              )}
+            </button>
           </div>
         </div>
       </div>
@@ -1028,6 +1218,17 @@ function BoardSubheader({ sprintName, code }: { sprintName: string; code: string
   const hasAnon           = r.participants.includes('Anon');
   const totalJoined       = r.participants.length;
 
+  const [showParts, setShowParts] = useState(false);
+  const partsRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!showParts) return;
+    const off = (e: PointerEvent) => {
+      if (partsRef.current && !partsRef.current.contains(e.target as Node)) setShowParts(false);
+    };
+    document.addEventListener('pointerdown', off, true);
+    return () => document.removeEventListener('pointerdown', off, true);
+  }, [showParts]);
+
   const exportPdf = () => {
     const win = window.open('', '_blank');
     if (!win) return;
@@ -1069,24 +1270,55 @@ function BoardSubheader({ sprintName, code }: { sprintName: string; code: string
     <div style={{
       display: 'flex', alignItems: 'center', gap: 16, padding: '8px 24px',
       borderBottom: `1px solid rgba(0,0,0,.07)`,
-      background: '#fff', flexShrink: 0,
+      background: PALETTE.paper, flexShrink: 0,
     }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        <div style={{ display: 'flex' }}>
-          {namedParticipants.slice(0, 5).map((a, i) => (
-            <div key={a} style={{ marginLeft: i === 0 ? 0 : -6, boxShadow: `0 0 0 2px ${PALETTE.paper}`, borderRadius: 999, zIndex: 5 - i, position: 'relative' }}>
-              <Avatar name={a} size={24} />
+      <div ref={partsRef} style={{ position: 'relative' }}>
+        <button onClick={() => setShowParts((v) => !v)} style={{
+          display: 'flex', alignItems: 'center', gap: 8,
+          border: 'none', background: showParts ? 'rgba(31,27,46,.06)' : 'transparent',
+          borderRadius: 8, padding: '4px 8px 4px 4px', cursor: 'pointer',
+        }}>
+          <div style={{ display: 'flex' }}>
+            {namedParticipants.slice(0, 5).map((a, i) => (
+              <div key={a} style={{ marginLeft: i === 0 ? 0 : -6, boxShadow: `0 0 0 2px ${PALETTE.paper}`, borderRadius: 999, zIndex: 5 - i, position: 'relative' }}>
+                <Avatar name={a} size={24} />
+              </div>
+            ))}
+            {hasAnon && (
+              <div style={{ marginLeft: namedParticipants.length > 0 ? -6 : 0, boxShadow: `0 0 0 2px ${PALETTE.paper}`, borderRadius: 999 }}>
+                <Avatar name="Anon" size={24} />
+              </div>
+            )}
+          </div>
+          <div style={{ fontSize: 12, fontWeight: 600, color: PALETTE.mute }}>
+            <b style={{ color: PALETTE.ink }}>{totalJoined}</b> joined
+          </div>
+        </button>
+
+        {showParts && (
+          <div style={{
+            position: 'absolute', top: 'calc(100% + 6px)', left: 0, zIndex: 50,
+            background: '#fff', borderRadius: 10, minWidth: 200,
+            boxShadow: '0 8px 24px rgba(0,0,0,.12), 0 0 0 1px rgba(0,0,0,.07)',
+            padding: '6px 0', fontFamily: FF.schibsted,
+          }}>
+            <div style={{ padding: '6px 14px 8px', fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.07em', color: PALETTE.mute }}>
+              {totalJoined} in this room
             </div>
-          ))}
-          {hasAnon && (
-            <div style={{ marginLeft: namedParticipants.length > 0 ? -6 : 0, boxShadow: `0 0 0 2px ${PALETTE.paper}`, borderRadius: 999 }}>
-              <Avatar name="Anon" size={24} />
-            </div>
-          )}
-        </div>
-        <div style={{ fontSize: 12, fontWeight: 600, color: PALETTE.mute }}>
-          <b style={{ color: PALETTE.ink }}>{totalJoined}</b> joined
-        </div>
+            {r.participants.map((name) => (
+              <div key={name} style={{
+                display: 'flex', alignItems: 'center', gap: 10,
+                padding: '6px 14px',
+              }}>
+                <Avatar name={name} size={22} />
+                <span style={{ fontSize: 13, fontWeight: 500, color: PALETTE.ink }}>
+                  {name}
+                  {name === r.userName && <span style={{ fontSize: 10, color: PALETTE.mute, marginLeft: 6, fontWeight: 600 }}>you</span>}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <div style={{ width: 1, height: 18, background: PALETTE.line }} />
@@ -1121,23 +1353,42 @@ const BOARD_CSS = `
   }
   @keyframes voteBump { 0% { transform:scale(1); } 40% { transform:scale(1.35); } 100% { transform:scale(1); } }
   .vote-bump { animation: voteBump 280ms ease-out; }
+  @keyframes spotlightPulse {
+    0%, 100% { transform: scale(1); }
+    50%       { transform: scale(1.008); }
+  }
+  @keyframes spotlightDot {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.3; }
+  }
+  .spotlight-card { animation: spotlightPulse 2s ease-in-out infinite; }
+  .spotlight-dot  { animation: spotlightDot  1.2s ease-in-out infinite; }
+  .retro-card::after {
+    content: '';
+    position: absolute;
+    bottom: 0; right: 0;
+    width: 20px; height: 20px;
+    background: linear-gradient(225deg, rgba(0,0,0,.12) 45%, transparent 45%);
+    border-radius: 0 0 10px 0;
+    pointer-events: none;
+  }
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-thumb { background: rgba(31,27,46,.18); border-radius: 3px; }
   ::-webkit-scrollbar-track { background: transparent; }
 `;
 
 // ── Sticky board ──────────────────────────────────────────────────────────────
-function StickyBoard({ sprintName, code }: { sprintName: string; code: string }) {
+function StickyBoard({ sprintName, team, code }: { sprintName: string; team: string; code: string }) {
   return (
     <div style={{
       width: '100%', height: '100vh',
-      background: '#EDECEA',
+      background: PALETTE.paper,
       color: PALETTE.ink,
       display: 'flex', flexDirection: 'column', overflow: 'hidden',
       fontFamily: FF.schibsted,
     }}>
       <style>{BOARD_CSS}</style>
-      <RetroHeader sprintName={sprintName} code={code} />
+      <RetroHeader sprintName={sprintName} team={team} code={code} />
       <BoardSubheader sprintName={sprintName} code={code} />
       <div style={{
         flex: 1, minHeight: 0,
@@ -1158,11 +1409,12 @@ function BoardContent() {
   const code       = params.get('code') ?? 'RETRO7';
   const name       = params.get('name') ?? 'You';
   const sprint     = params.get('sprint');
+  const team       = params.get('team') ?? '';
   const sprintName = sprint ?? `Retro · ${code}`;
 
   return (
     <RetroProvider userName={name} roomCode={code}>
-      <StickyBoard sprintName={sprintName} code={code} />
+      <StickyBoard sprintName={sprintName} team={team} code={code} />
     </RetroProvider>
   );
 }
