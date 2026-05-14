@@ -2,7 +2,7 @@
 
 import {
   useState, useEffect, useRef, useMemo, useCallback,
-  createContext, useContext, CSSProperties, Suspense,
+  createContext, useContext, Suspense,
 } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { createPortal } from 'react-dom';
@@ -113,16 +113,6 @@ interface RetroCtxValue {
 // ── Utilities ─────────────────────────────────────────────────────────────────
 function uid() { return 'c-' + Math.random().toString(36).slice(2, 9); }
 
-function mulberry32(seed: number) {
-  let t = seed >>> 0;
-  return () => {
-    t = (t + 0x6D2B79F5) >>> 0;
-    let r = t;
-    r = Math.imul(r ^ (r >>> 15), r | 1);
-    r ^= r + Math.imul(r ^ (r >>> 7), r | 61);
-    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
-  };
-}
 
 function dbToComment(row: Record<string, unknown>): RetroComment {
   return {
@@ -180,14 +170,15 @@ function RetroProvider({ userName, roomCode, team, children }: { userName: strin
   const [revealed,     _setRevealed]    = useState(false);
   const [activePhase,  setActivePhase]  = useState<PhaseId>('wentWell');
   const revealChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const timerChannelRef  = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const [drag,         setDrag]         = useState<DragState | null>(null);
   const [confetti,     setConfetti]     = useState<ConfettiBurst[]>([]);
-  const [timer,        setTimer]        = useState<TimerState>({ running: false, secs: 5 * 60, set: 5 * 60 });
+  const [timer,        _setTimer]       = useState<TimerState>({ running: false, secs: 5 * 60, set: 5 * 60 });
 
-  // Timer tick
+  // Timer tick — uses private setter so ticks are never broadcast
   useEffect(() => {
     if (!timer.running) return;
-    const t = setInterval(() => setTimer((p) => ({
+    const t = setInterval(() => _setTimer((p) => ({
       ...p, secs: Math.max(0, p.secs - 1), running: p.secs > 1 ? p.running : false,
     })), 1000);
     return () => clearInterval(t);
@@ -280,6 +271,23 @@ function RetroProvider({ userName, roomCode, team, children }: { userName: strin
       .subscribe();
     revealChannelRef.current = revealCh;
 
+    const timerCh = supabase
+      .channel(`timer-${roomCode}`)
+      .on('broadcast', { event: 'timer' }, ({ payload }) => {
+        if (cancelled) return;
+        if (payload.action === 'start') {
+          const elapsed = (Date.now() - (payload.at as number)) / 1000;
+          const secs = Math.max(0, Math.round((payload.secs as number) - elapsed));
+          _setTimer((t) => ({ ...t, running: true, secs }));
+        } else if (payload.action === 'pause') {
+          _setTimer((t) => ({ ...t, running: false, secs: payload.secs as number }));
+        } else if (payload.action === 'reset') {
+          _setTimer({ running: false, secs: payload.secs as number, set: payload.set as number });
+        }
+      })
+      .subscribe();
+    timerChannelRef.current = timerCh;
+
     return () => {
       cancelled = true;
       cardsSub.unsubscribe();
@@ -288,6 +296,8 @@ function RetroProvider({ userName, roomCode, team, children }: { userName: strin
       commentsSub.unsubscribe();
       revealCh.unsubscribe();
       revealChannelRef.current = null;
+      timerCh.unsubscribe();
+      timerChannelRef.current = null;
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomCode, userName]);
@@ -397,6 +407,24 @@ function RetroProvider({ userName, roomCode, team, children }: { userName: strin
       })
     ));
   }, [roomCode]);
+
+  const setTimer = useCallback((fn: (t: TimerState) => TimerState) => {
+    _setTimer((prev) => {
+      const next = fn(prev);
+      const ch = timerChannelRef.current;
+      if (next.running && !prev.running) {
+        // Started — include timestamp so receivers can compensate for latency
+        ch?.send({ type: 'broadcast', event: 'timer', payload: { action: 'start', secs: next.secs, at: Date.now() } });
+      } else if (!next.running && prev.running) {
+        // Paused
+        ch?.send({ type: 'broadcast', event: 'timer', payload: { action: 'pause', secs: next.secs } });
+      } else if (next.set !== prev.set) {
+        // Duration edited — reset
+        ch?.send({ type: 'broadcast', event: 'timer', payload: { action: 'reset', secs: next.secs, set: next.set } });
+      }
+      return next;
+    });
+  }, []);
 
   const setRevealed = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
     _setRevealed((prev) => {
@@ -1360,7 +1388,78 @@ function TimerPill() {
 
   const [editing, setEditing] = useState(false);
   const [draft,   setDraft]   = useState('');
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef   = useRef<HTMLInputElement>(null);
+  const audioCtx   = useRef<AudioContext | null>(null);
+  const mutedRef   = useRef(false);
+  const [muted, _setMuted] = useState(() => {
+    try { return localStorage.getItem('retro-timer-muted') === 'true'; } catch { return false; }
+  });
+  mutedRef.current = muted;
+
+  const getCtx = () => {
+    if (!audioCtx.current) {
+      audioCtx.current = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+    }
+    return audioCtx.current;
+  };
+
+  const playTick = (urgent: boolean) => {
+    if (mutedRef.current) return;
+    try {
+      const ctx = getCtx();
+      const osc  = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = 'sine';
+      osc.frequency.value = urgent ? 1000 : 720;
+      gain.gain.setValueAtTime(urgent ? 0.18 : 0.11, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.055);
+      osc.start(ctx.currentTime);
+      osc.stop(ctx.currentTime + 0.055);
+    } catch { /* ignore if audio unavailable */ }
+  };
+
+  const playDone = () => {
+    if (mutedRef.current) return;
+    try {
+      const ctx = getCtx();
+      // Ascending three-note chime: C5 → E5 → G5
+      [523.25, 659.25, 783.99].forEach((freq, i) => {
+        const osc  = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        const t = ctx.currentTime + i * 0.22;
+        gain.gain.setValueAtTime(0.22, t);
+        gain.gain.exponentialRampToValueAtTime(0.001, t + 0.65);
+        osc.start(t);
+        osc.stop(t + 0.65);
+      });
+    } catch { /* ignore */ }
+  };
+
+  // Play tick on every second change while running; chime on completion
+  const prevSecs = useRef(r.timer.secs);
+  useEffect(() => {
+    if (!r.timer.running) { prevSecs.current = r.timer.secs; return; }
+    if (r.timer.secs < prevSecs.current) {
+      if (r.timer.secs === 0) playDone();
+      else playTick(r.timer.secs <= 30);
+    }
+    prevSecs.current = r.timer.secs;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [r.timer.secs, r.timer.running]);
+
+  const toggleMute = () => {
+    _setMuted((m) => {
+      const next = !m;
+      try { localStorage.setItem('retro-timer-muted', String(next)); } catch { /* ignore */ }
+      return next;
+    });
+  };
 
   const startEdit = () => {
     if (r.timer.running) return;
@@ -1418,8 +1517,10 @@ function TimerPill() {
           {mm}:{ss}
         </div>
       )}
+
+      {/* Play / pause — initialise AudioContext on click to satisfy browser autoplay policy */}
       <button
-        onClick={() => r.setTimer((t) => ({ ...t, running: !t.running, secs: t.secs === 0 ? t.set : t.secs }))}
+        onClick={() => { getCtx(); r.setTimer((t) => ({ ...t, running: !t.running, secs: t.secs === 0 ? t.set : t.secs })); }}
         style={{
           border: 'none',
           background: r.timer.running ? PALETTE.ink : PALETTE.phases.continue.hero,
@@ -1431,6 +1532,28 @@ function TimerPill() {
         {r.timer.running
           ? <svg width="9" height="9" viewBox="0 0 9 9" fill="currentColor"><rect x="0" y="0" width="3" height="9" rx="1"/><rect x="6" y="0" width="3" height="9" rx="1"/></svg>
           : <svg width="9" height="9" viewBox="0 0 9 9" fill="currentColor"><path d="M1 0l7 4.5L1 9z"/></svg>
+        }
+      </button>
+
+      {/* Mute toggle */}
+      <button
+        onClick={toggleMute}
+        title={muted ? 'Unmute timer' : 'Mute timer'}
+        style={{
+          border: 'none', background: 'transparent', cursor: 'pointer',
+          color: muted ? PALETTE.mute : PALETTE.ink,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          zIndex: 1, flexShrink: 0, padding: '0 2px',
+          opacity: muted ? 0.45 : 1,
+        }}
+      >
+        {muted
+          ? <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M7 2.5 4 5.5H1.5v3H4l3 3V2.5Z" /><path d="M11 5l-4 4M11 9l-4-4" />
+            </svg>
+          : <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M7 2.5 4 5.5H1.5v3H4l3 3V2.5Z" /><path d="M9.5 5a3 3 0 0 1 0 4" /><path d="M11.5 3a6 6 0 0 1 0 8" />
+            </svg>
         }
       </button>
     </div>
@@ -1722,14 +1845,12 @@ function BoardSubheader({ sprintName, code }: { sprintName: string; code: string
   }, [showParts]);
 
   const exportPdf = () => {
-    const win = window.open('', '_blank');
-    if (!win) return;
     const phaseRows = PHASES.map((ph) => {
       const pCards = r.cards.filter((c) => c.phase === ph.id).sort((a, b) => b.votes - a.votes);
       const pc     = PALETTE.phases[ph.id];
       const cardHtml = pCards.map((c) => `
         <div style="background:${pc.sticky};border-radius:4px;padding:12px 14px;margin-bottom:8px;break-inside:avoid;">
-          <div style="font-size:14px;line-height:1.4;color:${pc.ink};margin-bottom:6px;">${c.text.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>
+          <div style="font-size:14px;line-height:1.4;color:${pc.ink};margin-bottom:6px;">${c.text.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>
           <div style="font-size:11px;opacity:.7;color:${pc.ink};display:flex;gap:10px;">
             <span>${c.author}</span>
             ${c.votes > 0 ? `<span>▲ ${c.votes}</span>` : ''}
@@ -1748,17 +1869,27 @@ function BoardSubheader({ sprintName, code }: { sprintName: string; code: string
         body{font-family:system-ui,sans-serif;padding:32px;color:#1F1B2E;background:#FFF8EC;margin:0}
         h1{font-size:24px;margin:0 0 6px}
         .meta{font-size:12px;color:#6B6478;margin-bottom:28px}
-        @media print{body{padding:20px}}
+        @media print{body{padding:20px}@page{margin:1.5cm}}
       </style></head><body>
       <h1>${sprintName}</h1>
       <div class="meta">Room: ${code} · ${totalCards} cards · ${totalVotes} votes · ${totalJoined} joined · Exported ${new Date().toLocaleDateString()}</div>
       ${phaseRows}
-      <script>window.onload=function(){window.print();window.close();}<\/script>
+      <script>window.print();<\/script>
     </body></html>`;
+
     const blob = new Blob([html], { type: 'text/html' });
-    const url = URL.createObjectURL(blob);
-    win.location.href = url;
-    win.addEventListener('afterprint', () => URL.revokeObjectURL(url));
+    const url  = URL.createObjectURL(blob);
+    const win  = window.open(url, '_blank');
+    if (win) {
+      win.addEventListener('afterprint', () => { URL.revokeObjectURL(url); win.close(); });
+    } else {
+      // Popup blocked — fall back to same-tab navigation
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${sprintName}.html`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    }
   };
 
   return (
