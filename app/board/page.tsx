@@ -2,7 +2,7 @@
 
 import {
   useState, useEffect, useRef, useMemo, useCallback,
-  createContext, useContext, CSSProperties, Suspense,
+  createContext, useContext, Suspense,
 } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { createPortal } from 'react-dom';
@@ -113,16 +113,6 @@ interface RetroCtxValue {
 // ── Utilities ─────────────────────────────────────────────────────────────────
 function uid() { return 'c-' + Math.random().toString(36).slice(2, 9); }
 
-function mulberry32(seed: number) {
-  let t = seed >>> 0;
-  return () => {
-    t = (t + 0x6D2B79F5) >>> 0;
-    let r = t;
-    r = Math.imul(r ^ (r >>> 15), r | 1);
-    r ^= r + Math.imul(r ^ (r >>> 7), r | 61);
-    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
-  };
-}
 
 function dbToComment(row: Record<string, unknown>): RetroComment {
   return {
@@ -1817,14 +1807,12 @@ function BoardSubheader({ sprintName, code }: { sprintName: string; code: string
   }, [showParts]);
 
   const exportPdf = () => {
-    const win = window.open('', '_blank');
-    if (!win) return;
     const phaseRows = PHASES.map((ph) => {
       const pCards = r.cards.filter((c) => c.phase === ph.id).sort((a, b) => b.votes - a.votes);
       const pc     = PALETTE.phases[ph.id];
       const cardHtml = pCards.map((c) => `
         <div style="background:${pc.sticky};border-radius:4px;padding:12px 14px;margin-bottom:8px;break-inside:avoid;">
-          <div style="font-size:14px;line-height:1.4;color:${pc.ink};margin-bottom:6px;">${c.text.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>
+          <div style="font-size:14px;line-height:1.4;color:${pc.ink};margin-bottom:6px;">${c.text.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>
           <div style="font-size:11px;opacity:.7;color:${pc.ink};display:flex;gap:10px;">
             <span>${c.author}</span>
             ${c.votes > 0 ? `<span>▲ ${c.votes}</span>` : ''}
@@ -1843,17 +1831,27 @@ function BoardSubheader({ sprintName, code }: { sprintName: string; code: string
         body{font-family:system-ui,sans-serif;padding:32px;color:#1F1B2E;background:#FFF8EC;margin:0}
         h1{font-size:24px;margin:0 0 6px}
         .meta{font-size:12px;color:#6B6478;margin-bottom:28px}
-        @media print{body{padding:20px}}
+        @media print{body{padding:20px}@page{margin:1.5cm}}
       </style></head><body>
       <h1>${sprintName}</h1>
       <div class="meta">Room: ${code} · ${totalCards} cards · ${totalVotes} votes · ${totalJoined} joined · Exported ${new Date().toLocaleDateString()}</div>
       ${phaseRows}
-      <script>window.onload=function(){window.print();window.close();}<\/script>
+      <script>window.print();<\/script>
     </body></html>`;
+
     const blob = new Blob([html], { type: 'text/html' });
-    const url = URL.createObjectURL(blob);
-    win.location.href = url;
-    win.addEventListener('afterprint', () => URL.revokeObjectURL(url));
+    const url  = URL.createObjectURL(blob);
+    const win  = window.open(url, '_blank');
+    if (win) {
+      win.addEventListener('afterprint', () => { URL.revokeObjectURL(url); win.close(); });
+    } else {
+      // Popup blocked — fall back to same-tab navigation
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${sprintName}.html`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    }
   };
 
   return (
