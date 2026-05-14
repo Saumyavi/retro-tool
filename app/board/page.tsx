@@ -170,14 +170,15 @@ function RetroProvider({ userName, roomCode, team, children }: { userName: strin
   const [revealed,     _setRevealed]    = useState(false);
   const [activePhase,  setActivePhase]  = useState<PhaseId>('wentWell');
   const revealChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const timerChannelRef  = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const [drag,         setDrag]         = useState<DragState | null>(null);
   const [confetti,     setConfetti]     = useState<ConfettiBurst[]>([]);
-  const [timer,        setTimer]        = useState<TimerState>({ running: false, secs: 5 * 60, set: 5 * 60 });
+  const [timer,        _setTimer]       = useState<TimerState>({ running: false, secs: 5 * 60, set: 5 * 60 });
 
-  // Timer tick
+  // Timer tick — uses private setter so ticks are never broadcast
   useEffect(() => {
     if (!timer.running) return;
-    const t = setInterval(() => setTimer((p) => ({
+    const t = setInterval(() => _setTimer((p) => ({
       ...p, secs: Math.max(0, p.secs - 1), running: p.secs > 1 ? p.running : false,
     })), 1000);
     return () => clearInterval(t);
@@ -270,6 +271,23 @@ function RetroProvider({ userName, roomCode, team, children }: { userName: strin
       .subscribe();
     revealChannelRef.current = revealCh;
 
+    const timerCh = supabase
+      .channel(`timer-${roomCode}`)
+      .on('broadcast', { event: 'timer' }, ({ payload }) => {
+        if (cancelled) return;
+        if (payload.action === 'start') {
+          const elapsed = (Date.now() - (payload.at as number)) / 1000;
+          const secs = Math.max(0, Math.round((payload.secs as number) - elapsed));
+          _setTimer((t) => ({ ...t, running: true, secs }));
+        } else if (payload.action === 'pause') {
+          _setTimer((t) => ({ ...t, running: false, secs: payload.secs as number }));
+        } else if (payload.action === 'reset') {
+          _setTimer({ running: false, secs: payload.secs as number, set: payload.set as number });
+        }
+      })
+      .subscribe();
+    timerChannelRef.current = timerCh;
+
     return () => {
       cancelled = true;
       cardsSub.unsubscribe();
@@ -278,6 +296,8 @@ function RetroProvider({ userName, roomCode, team, children }: { userName: strin
       commentsSub.unsubscribe();
       revealCh.unsubscribe();
       revealChannelRef.current = null;
+      timerCh.unsubscribe();
+      timerChannelRef.current = null;
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomCode, userName]);
@@ -387,6 +407,24 @@ function RetroProvider({ userName, roomCode, team, children }: { userName: strin
       })
     ));
   }, [roomCode]);
+
+  const setTimer = useCallback((fn: (t: TimerState) => TimerState) => {
+    _setTimer((prev) => {
+      const next = fn(prev);
+      const ch = timerChannelRef.current;
+      if (next.running && !prev.running) {
+        // Started — include timestamp so receivers can compensate for latency
+        ch?.send({ type: 'broadcast', event: 'timer', payload: { action: 'start', secs: next.secs, at: Date.now() } });
+      } else if (!next.running && prev.running) {
+        // Paused
+        ch?.send({ type: 'broadcast', event: 'timer', payload: { action: 'pause', secs: next.secs } });
+      } else if (next.set !== prev.set) {
+        // Duration edited — reset
+        ch?.send({ type: 'broadcast', event: 'timer', payload: { action: 'reset', secs: next.secs, set: next.set } });
+      }
+      return next;
+    });
+  }, []);
 
   const setRevealed = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
     _setRevealed((prev) => {
