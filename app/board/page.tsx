@@ -177,8 +177,9 @@ function RetroProvider({ userName, roomCode, team, children }: { userName: strin
   const [cards,        setCards]        = useState<RetroCard[]>([]);
   const [participants, setParticipants] = useState<string[]>([]);
   const [composerFor,  setComposerFor]  = useState<PhaseId | null>(null);
-  const [revealed,     setRevealed]     = useState(true);
+  const [revealed,     _setRevealed]    = useState(false);
   const [activePhase,  setActivePhase]  = useState<PhaseId>('wentWell');
+  const revealChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const [drag,         setDrag]         = useState<DragState | null>(null);
   const [confetti,     setConfetti]     = useState<ConfettiBurst[]>([]);
   const [timer,        setTimer]        = useState<TimerState>({ running: false, secs: 5 * 60, set: 5 * 60 });
@@ -271,12 +272,22 @@ function RetroProvider({ userName, roomCode, team, children }: { userName: strin
       .on('postgres_changes', { event: '*', schema: 'public', table: 'retro_comments', filter: `room_code=eq.${roomCode}` }, refetchComments)
       .subscribe();
 
+    const revealCh = supabase
+      .channel(`reveal-${roomCode}`)
+      .on('broadcast', { event: 'reveal' }, ({ payload }) => {
+        if (!cancelled) _setRevealed(payload.revealed as boolean);
+      })
+      .subscribe();
+    revealChannelRef.current = revealCh;
+
     return () => {
       cancelled = true;
       cardsSub.unsubscribe();
       partsSub.unsubscribe();
       spotlightSub.unsubscribe();
       commentsSub.unsubscribe();
+      revealCh.unsubscribe();
+      revealChannelRef.current = null;
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomCode, userName]);
@@ -386,6 +397,21 @@ function RetroProvider({ userName, roomCode, team, children }: { userName: strin
       })
     ));
   }, [roomCode]);
+
+  const setRevealed = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
+    _setRevealed((prev) => {
+      const next = typeof v === 'function' ? v(prev) : v;
+      revealChannelRef.current?.send({ type: 'broadcast', event: 'reveal', payload: { revealed: next } });
+      return next;
+    });
+  }, []);
+
+  // Re-broadcast reveal state to late-joining participants (creator only)
+  useEffect(() => {
+    if (!isCreator || participants.length === 0) return;
+    revealChannelRef.current?.send({ type: 'broadcast', event: 'reveal', payload: { revealed } });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [participants.length]);
 
   return (
     <RetroCtx.Provider value={{
