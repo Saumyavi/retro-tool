@@ -1360,7 +1360,78 @@ function TimerPill() {
 
   const [editing, setEditing] = useState(false);
   const [draft,   setDraft]   = useState('');
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef   = useRef<HTMLInputElement>(null);
+  const audioCtx   = useRef<AudioContext | null>(null);
+  const mutedRef   = useRef(false);
+  const [muted, _setMuted] = useState(() => {
+    try { return localStorage.getItem('retro-timer-muted') === 'true'; } catch { return false; }
+  });
+  mutedRef.current = muted;
+
+  const getCtx = () => {
+    if (!audioCtx.current) {
+      audioCtx.current = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+    }
+    return audioCtx.current;
+  };
+
+  const playTick = (urgent: boolean) => {
+    if (mutedRef.current) return;
+    try {
+      const ctx = getCtx();
+      const osc  = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.type = 'sine';
+      osc.frequency.value = urgent ? 1000 : 720;
+      gain.gain.setValueAtTime(urgent ? 0.18 : 0.11, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.055);
+      osc.start(ctx.currentTime);
+      osc.stop(ctx.currentTime + 0.055);
+    } catch { /* ignore if audio unavailable */ }
+  };
+
+  const playDone = () => {
+    if (mutedRef.current) return;
+    try {
+      const ctx = getCtx();
+      // Ascending three-note chime: C5 → E5 → G5
+      [523.25, 659.25, 783.99].forEach((freq, i) => {
+        const osc  = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        const t = ctx.currentTime + i * 0.22;
+        gain.gain.setValueAtTime(0.22, t);
+        gain.gain.exponentialRampToValueAtTime(0.001, t + 0.65);
+        osc.start(t);
+        osc.stop(t + 0.65);
+      });
+    } catch { /* ignore */ }
+  };
+
+  // Play tick on every second change while running; chime on completion
+  const prevSecs = useRef(r.timer.secs);
+  useEffect(() => {
+    if (!r.timer.running) { prevSecs.current = r.timer.secs; return; }
+    if (r.timer.secs < prevSecs.current) {
+      if (r.timer.secs === 0) playDone();
+      else playTick(r.timer.secs <= 30);
+    }
+    prevSecs.current = r.timer.secs;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [r.timer.secs, r.timer.running]);
+
+  const toggleMute = () => {
+    _setMuted((m) => {
+      const next = !m;
+      try { localStorage.setItem('retro-timer-muted', String(next)); } catch { /* ignore */ }
+      return next;
+    });
+  };
 
   const startEdit = () => {
     if (r.timer.running) return;
@@ -1418,8 +1489,10 @@ function TimerPill() {
           {mm}:{ss}
         </div>
       )}
+
+      {/* Play / pause — initialise AudioContext on click to satisfy browser autoplay policy */}
       <button
-        onClick={() => r.setTimer((t) => ({ ...t, running: !t.running, secs: t.secs === 0 ? t.set : t.secs }))}
+        onClick={() => { getCtx(); r.setTimer((t) => ({ ...t, running: !t.running, secs: t.secs === 0 ? t.set : t.secs })); }}
         style={{
           border: 'none',
           background: r.timer.running ? PALETTE.ink : PALETTE.phases.continue.hero,
@@ -1431,6 +1504,28 @@ function TimerPill() {
         {r.timer.running
           ? <svg width="9" height="9" viewBox="0 0 9 9" fill="currentColor"><rect x="0" y="0" width="3" height="9" rx="1"/><rect x="6" y="0" width="3" height="9" rx="1"/></svg>
           : <svg width="9" height="9" viewBox="0 0 9 9" fill="currentColor"><path d="M1 0l7 4.5L1 9z"/></svg>
+        }
+      </button>
+
+      {/* Mute toggle */}
+      <button
+        onClick={toggleMute}
+        title={muted ? 'Unmute timer' : 'Mute timer'}
+        style={{
+          border: 'none', background: 'transparent', cursor: 'pointer',
+          color: muted ? PALETTE.mute : PALETTE.ink,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          zIndex: 1, flexShrink: 0, padding: '0 2px',
+          opacity: muted ? 0.45 : 1,
+        }}
+      >
+        {muted
+          ? <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M7 2.5 4 5.5H1.5v3H4l3 3V2.5Z" /><path d="M11 5l-4 4M11 9l-4-4" />
+            </svg>
+          : <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M7 2.5 4 5.5H1.5v3H4l3 3V2.5Z" /><path d="M9.5 5a3 3 0 0 1 0 4" /><path d="M11.5 3a6 6 0 0 1 0 8" />
+            </svg>
         }
       </button>
     </div>
